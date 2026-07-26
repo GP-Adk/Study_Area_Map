@@ -1,0 +1,787 @@
+from pathlib import Path
+import os
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from shapely.geometry import Point
+
+
+# ============================================================
+# 1. INPUT AND OUTPUT PATHS
+# ============================================================
+
+# Keep the following files together:
+# local_unit.shp
+# local_unit.shx
+# local_unit.dbf
+# local_unit.prj
+
+# When the shapefile and notebook are in the same folder:
+LOCAL_UNIT_SHP = Path("local_unit.shp")
+
+# Windows example:
+# LOCAL_UNIT_SHP = Path(
+#     r"C:\Users\gpadh\Downloads\Nepal_administrative_map"
+#     r"\local_unit.shp"
+# )
+
+# Create a separate output folder
+OUTPUT_DIR = Path("kathmandu_valley_study_area")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+PNG_OUTPUT = (
+    OUTPUT_DIR
+    / "Kathmandu_Valley_study_area_map.png"
+)
+
+PDF_OUTPUT = (
+    OUTPUT_DIR
+    / "Kathmandu_Valley_study_area_map.pdf"
+)
+
+SVG_OUTPUT = (
+    OUTPUT_DIR
+    / "Kathmandu_Valley_study_area_map.svg"
+)
+
+
+# ============================================================
+# 2. ICIMOD AERONET SITE INFORMATION
+# ============================================================
+
+ICIMOD_SITE = {
+    "name": "ICIMOD AERONET",
+    "longitude": 85.323269,
+    "latitude": 27.646647,
+    "elevation_m": 1326,
+}
+
+
+# ============================================================
+# 3. DISTRICTS DEFINING KATHMANDU VALLEY
+# ============================================================
+
+KATHMANDU_VALLEY_DISTRICTS = [
+    "KATHMANDU",
+    "LALITPUR",
+    "BHAKTAPUR",
+]
+
+
+# ============================================================
+# 4. READ THE UPDATED ADMINISTRATIVE SHAPEFILE
+# ============================================================
+
+if not LOCAL_UNIT_SHP.exists():
+    raise FileNotFoundError(
+        "The shapefile was not found:\n"
+        f"{LOCAL_UNIT_SHP.resolve()}\n\n"
+        "Place local_unit.shp, local_unit.shx, "
+        "local_unit.dbf, and local_unit.prj "
+        "in the same folder."
+    )
+
+os.environ["SHAPE_RESTORE_SHX"] = "YES"
+
+local_units = gpd.read_file(
+    LOCAL_UNIT_SHP,
+    engine="fiona",
+)
+
+print("Original CRS:")
+print(local_units.crs)
+
+print("\nAvailable columns:")
+print(local_units.columns.tolist())
+
+
+# ============================================================
+# 5. CHECK AND CONVERT THE CRS
+# ============================================================
+
+if local_units.crs is None:
+    raise ValueError(
+        "The shapefile has no coordinate reference system. "
+        "Make sure local_unit.prj is present."
+    )
+
+# Convert to WGS84 longitude and latitude
+local_units = local_units.to_crs(
+    "EPSG:4326"
+)
+
+
+# ============================================================
+# 6. STANDARDIZE ATTRIBUTE COLUMNS
+# ============================================================
+
+required_columns = [
+    "DISTRICT",
+    "GaPa_NaPa",
+]
+
+missing_columns = [
+    column
+    for column in required_columns
+    if column not in local_units.columns
+]
+
+if missing_columns:
+    raise KeyError(
+        "Required columns were not found:\n"
+        f"{missing_columns}\n\n"
+        f"Available columns:\n"
+        f"{local_units.columns.tolist()}"
+    )
+
+local_units["DISTRICT"] = (
+    local_units["DISTRICT"]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+)
+
+local_units["GaPa_NaPa"] = (
+    local_units["GaPa_NaPa"]
+    .astype(str)
+    .str.strip()
+)
+
+
+# ============================================================
+# 7. CREATE DISTRICT AND NEPAL BOUNDARIES
+# ============================================================
+
+# District polygons created from local units
+districts = local_units.dissolve(
+    by="DISTRICT",
+    as_index=False,
+)
+
+# Complete outer boundary of Nepal
+nepal_boundary = local_units.dissolve()
+
+
+# ============================================================
+# 8. SELECT KATHMANDU VALLEY
+# ============================================================
+
+valley_local_units = local_units[
+    local_units["DISTRICT"].isin(
+        KATHMANDU_VALLEY_DISTRICTS
+    )
+].copy()
+
+valley_districts = districts[
+    districts["DISTRICT"].isin(
+        KATHMANDU_VALLEY_DISTRICTS
+    )
+].copy()
+
+# Combined Kathmandu Valley outline
+valley_boundary = valley_districts.dissolve()
+
+if valley_local_units.empty:
+    raise ValueError(
+        "Kathmandu Valley districts were not found "
+        "in the administrative shapefile."
+    )
+
+
+# ============================================================
+# 9. CREATE THE ICIMOD STATION POINT
+# ============================================================
+
+icimod_station = gpd.GeoDataFrame(
+    {
+        "site": [ICIMOD_SITE["name"]],
+        "elevation_m": [
+            ICIMOD_SITE["elevation_m"]
+        ],
+    },
+    geometry=[
+        Point(
+            ICIMOD_SITE["longitude"],
+            ICIMOD_SITE["latitude"],
+        )
+    ],
+    crs="EPSG:4326",
+)
+
+
+# ============================================================
+# 10. IDENTIFY THE DISTRICT CONTAINING THE STATION
+# ============================================================
+
+station_district_join = gpd.sjoin(
+    icimod_station,
+    valley_districts[
+        [
+            "DISTRICT",
+            "geometry",
+        ]
+    ],
+    how="left",
+    predicate="intersects",
+)
+
+if station_district_join["DISTRICT"].isna().all():
+    station_district_name = None
+    print(
+        "\nThe station could not be matched "
+        "with a Kathmandu Valley district."
+    )
+else:
+    station_district_name = (
+        station_district_join["DISTRICT"]
+        .dropna()
+        .iloc[0]
+    )
+
+    print("\nDistrict containing the station:")
+    print(station_district_name)
+
+
+# ============================================================
+# 11. IDENTIFY THE LOCAL UNIT CONTAINING THE STATION
+# ============================================================
+
+station_local_join = gpd.sjoin(
+    icimod_station,
+    valley_local_units[
+        [
+            "DISTRICT",
+            "GaPa_NaPa",
+            "geometry",
+        ]
+    ],
+    how="left",
+    predicate="intersects",
+)
+
+if station_local_join["GaPa_NaPa"].isna().all():
+    station_local_unit_name = None
+    station_local_unit = None
+
+    print(
+        "\nThe local unit containing the station "
+        "could not be identified."
+    )
+
+else:
+    station_local_unit_name = (
+        station_local_join["GaPa_NaPa"]
+        .dropna()
+        .iloc[0]
+    )
+
+    station_local_unit = valley_local_units[
+        valley_local_units["GaPa_NaPa"]
+        == station_local_unit_name
+    ].copy()
+
+    print("\nLocal unit containing the station:")
+    print(station_local_unit_name)
+
+
+# ============================================================
+# 12. CALCULATE MAP EXTENTS
+# ============================================================
+
+def calculate_extent(
+    geodataframe,
+    x_padding_fraction=0.08,
+    y_padding_fraction=0.08,
+):
+    """
+    Calculate a padded map extent.
+    """
+
+    min_x, min_y, max_x, max_y = (
+        geodataframe.total_bounds
+    )
+
+    width = max_x - min_x
+    height = max_y - min_y
+
+    x_padding = (
+        width * x_padding_fraction
+    )
+
+    y_padding = (
+        height * y_padding_fraction
+    )
+
+    return [
+        min_x - x_padding,
+        max_x + x_padding,
+        min_y - y_padding,
+        max_y + y_padding,
+    ]
+
+
+nepal_extent = calculate_extent(
+    nepal_boundary,
+    x_padding_fraction=0.04,
+    y_padding_fraction=0.07,
+)
+
+valley_extent = calculate_extent(
+    valley_boundary,
+    x_padding_fraction=0.12,
+    y_padding_fraction=0.12,
+)
+
+
+# ============================================================
+# 13. FIGURE STYLE
+# ============================================================
+
+plt.rcParams.update(
+    {
+        "font.family": "serif",
+        "font.serif": [
+            "Times New Roman",
+            "DejaVu Serif",
+        ],
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "axes.linewidth": 0.9,
+    }
+)
+
+
+# ============================================================
+# 14. HELPER FUNCTIONS
+# ============================================================
+
+def format_map_axis(
+    axis,
+    extent,
+    title,
+    panel_label,
+):
+    """
+    Format the map extent, grid, labels, and title.
+    """
+
+    axis.set_xlim(
+        extent[0],
+        extent[1],
+    )
+
+    axis.set_ylim(
+        extent[2],
+        extent[3],
+    )
+
+    axis.set_aspect(
+        "equal",
+        adjustable="box",
+    )
+
+    axis.set_xlabel(
+        "Longitude (°E)"
+    )
+
+    axis.set_ylabel(
+        "Latitude (°N)"
+    )
+
+    axis.set_title(
+        title,
+        fontweight="bold",
+        pad=9,
+    )
+
+    axis.grid(
+        True,
+        linestyle=":",
+        linewidth=0.45,
+        alpha=0.65,
+    )
+
+    for spine in axis.spines.values():
+        spine.set_color("black")
+        spine.set_linewidth(1.0)
+
+    axis.text(
+        0.02,
+        0.97,
+        panel_label,
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        bbox={
+            "facecolor": "white",
+            "edgecolor": "black",
+            "linewidth": 0.7,
+            "boxstyle": "square,pad=0.20",
+        },
+        zorder=30,
+    )
+
+
+def plot_icimod_station(
+    axis,
+    longitude_offset,
+    latitude_offset,
+):
+    """
+    Plot and label the ICIMOD AERONET station.
+    """
+
+    axis.scatter(
+        ICIMOD_SITE["longitude"],
+        ICIMOD_SITE["latitude"],
+        marker="*",
+        s=180,
+        facecolor="red",
+        edgecolor="black",
+        linewidth=0.9,
+        zorder=20,
+    )
+
+    axis.annotate(
+        "ICIMOD AERONET",
+        xy=(
+            ICIMOD_SITE["longitude"],
+            ICIMOD_SITE["latitude"],
+        ),
+        xytext=(
+            ICIMOD_SITE["longitude"]
+            + longitude_offset,
+            ICIMOD_SITE["latitude"]
+            + latitude_offset,
+        ),
+        fontsize=9,
+        fontweight="bold",
+        ha="left",
+        va="bottom",
+        arrowprops={
+            "arrowstyle": "-",
+            "linewidth": 0.8,
+            "color": "black",
+        },
+        bbox={
+            "facecolor": "white",
+            "edgecolor": "none",
+            "alpha": 0.82,
+            "pad": 1.5,
+        },
+        zorder=21,
+    )
+
+
+def add_north_arrow(
+    axis,
+    x=0.91,
+    y=0.88,
+):
+    """
+    Add a simple north arrow.
+    """
+
+    axis.annotate(
+        "N",
+        xy=(x, y),
+        xytext=(x, y - 0.13),
+        xycoords=axis.transAxes,
+        textcoords=axis.transAxes,
+        ha="center",
+        va="center",
+        fontsize=10,
+        fontweight="bold",
+        arrowprops={
+            "arrowstyle": "-|>",
+            "linewidth": 1.1,
+            "color": "black",
+        },
+        zorder=30,
+    )
+
+
+def add_district_labels(
+    axis,
+    district_layer,
+):
+    """
+    Add labels for Kathmandu, Lalitpur, and Bhaktapur.
+    """
+
+    for _, row in district_layer.iterrows():
+
+        label_point = (
+            row.geometry
+            .representative_point()
+        )
+
+        axis.text(
+            label_point.x,
+            label_point.y,
+            row["DISTRICT"].title(),
+            fontsize=8,
+            fontweight="bold",
+            ha="center",
+            va="center",
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.65,
+                "pad": 1.0,
+            },
+            zorder=12,
+        )
+
+
+# ============================================================
+# 15. CREATE THE TWO-PANEL FIGURE
+# ============================================================
+
+fig, axes = plt.subplots(
+    nrows=1,
+    ncols=2,
+    figsize=(12, 6.2),
+    gridspec_kw={
+        "width_ratios": [
+            1.35,
+            1.00,
+        ],
+        "wspace": 0.16,
+    },
+)
+
+ax_nepal = axes[0]
+ax_valley = axes[1]
+
+
+# ============================================================
+# 16. PANEL (a): NEPAL MAP
+# ============================================================
+
+# Local administrative boundaries
+local_units.plot(
+    ax=ax_nepal,
+    facecolor="#f7f7f7",
+    edgecolor="0.68",
+    linewidth=0.20,
+    zorder=1,
+)
+
+# District boundaries
+districts.boundary.plot(
+    ax=ax_nepal,
+    color="0.35",
+    linewidth=0.45,
+    zorder=2,
+)
+
+# Nepal outer border
+nepal_boundary.boundary.plot(
+    ax=ax_nepal,
+    color="black",
+    linewidth=1.1,
+    zorder=3,
+)
+
+# Highlight Kathmandu Valley districts
+valley_districts.plot(
+    ax=ax_nepal,
+    facecolor="#f2b968",
+    edgecolor="black",
+    linewidth=0.75,
+    zorder=5,
+)
+
+# ICIMOD station
+plot_icimod_station(
+    ax_nepal,
+    longitude_offset=0.15,
+    latitude_offset=0.08,
+)
+
+format_map_axis(
+    ax_nepal,
+    nepal_extent,
+    "Location of Kathmandu Valley and the ICIMOD AERONET station",
+    "(a)",
+)
+
+add_north_arrow(
+    ax_nepal,
+    x=0.92,
+    y=0.88,
+)
+
+
+# ============================================================
+# 17. PANEL (b): KATHMANDU VALLEY MAP
+# ============================================================
+
+# All local units within the valley
+valley_local_units.plot(
+    ax=ax_valley,
+    facecolor="#f4f1e8",
+    edgecolor="0.45",
+    linewidth=0.55,
+    zorder=1,
+)
+
+# Highlight the local unit containing the station
+if (
+    station_local_unit is not None
+    and not station_local_unit.empty
+):
+    station_local_unit.plot(
+        ax=ax_valley,
+        facecolor="#f2b968",
+        edgecolor="black",
+        linewidth=0.9,
+        zorder=3,
+    )
+
+# District boundaries
+valley_districts.boundary.plot(
+    ax=ax_valley,
+    color="black",
+    linewidth=1.0,
+    zorder=4,
+)
+
+# Kathmandu Valley outer boundary
+valley_boundary.boundary.plot(
+    ax=ax_valley,
+    color="black",
+    linewidth=1.3,
+    zorder=5,
+)
+
+# District names
+add_district_labels(
+    ax_valley,
+    valley_districts,
+)
+
+# Station marker and label
+plot_icimod_station(
+    ax_valley,
+    longitude_offset=0.010,
+    latitude_offset=0.008,
+)
+
+format_map_axis(
+    ax_valley,
+    valley_extent,
+    "Kathmandu Valley and the ICIMOD AERONET site",
+    "(b)",
+)
+
+add_north_arrow(
+    ax_valley,
+    x=0.90,
+    y=0.88,
+)
+
+
+# ============================================================
+# 18. LEGEND
+# ============================================================
+
+legend_elements = [
+    Patch(
+        facecolor="#f2b968",
+        edgecolor="black",
+        label=(
+            station_local_unit_name
+            if station_local_unit_name is not None
+            else "Station local unit"
+        ),
+    ),
+    Patch(
+        facecolor="#f4f1e8",
+        edgecolor="0.45",
+        label="Other local units",
+    ),
+    Line2D(
+        [0],
+        [0],
+        marker="*",
+        color="none",
+        markerfacecolor="red",
+        markeredgecolor="black",
+        markersize=13,
+        label="ICIMOD AERONET station",
+    ),
+]
+
+ax_valley.legend(
+    handles=legend_elements,
+    loc="lower left",
+    fontsize=8,
+    frameon=True,
+    framealpha=0.95,
+    edgecolor="black",
+)
+
+
+# ============================================================
+# 19. SAVE THE FIGURE
+# ============================================================
+
+fig.savefig(
+    PNG_OUTPUT,
+    dpi=600,
+    bbox_inches="tight",
+    facecolor="white",
+)
+
+fig.savefig(
+    PDF_OUTPUT,
+    bbox_inches="tight",
+    facecolor="white",
+)
+
+fig.savefig(
+    SVG_OUTPUT,
+    bbox_inches="tight",
+    facecolor="white",
+)
+
+plt.show()
+
+
+# ============================================================
+# 20. PRINT OUTPUT INFORMATION
+# ============================================================
+
+print("\n" + "=" * 80)
+print("KATHMANDU VALLEY STUDY-AREA FIGURE COMPLETED")
+print("=" * 80)
+
+print("\nKathmandu Valley districts:")
+print(", ".join(KATHMANDU_VALLEY_DISTRICTS))
+
+print("\nDistrict containing the ICIMOD station:")
+print(station_district_name)
+
+print("\nLocal unit containing the ICIMOD station:")
+print(station_local_unit_name)
+
+print("\nFiles saved inside:")
+print(OUTPUT_DIR.resolve())
+
+print("\nPNG:")
+print(PNG_OUTPUT.resolve())
+
+print("\nPDF:")
+print(PDF_OUTPUT.resolve())
+
+print("\nSVG:")
+print(SVG_OUTPUT.resolve())
