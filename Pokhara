@@ -1,0 +1,683 @@
+from pathlib import Path
+import os
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from shapely.geometry import Point
+
+
+# ============================================================
+# 1. INPUT AND OUTPUT PATHS
+# ============================================================
+
+# Keep all shapefile components in the same folder:
+# local_unit.shp
+# local_unit.shx
+# local_unit.dbf
+# local_unit.prj
+#
+# When the shapefile and notebook are in the same folder:
+LOCAL_UNIT_SHP = Path("local_unit.shp")
+
+# Windows example:
+# LOCAL_UNIT_SHP = Path(
+#     r"C:\Users\gpadh\Downloads\Nepal_administrative_map"
+#     r"\local_unit.shp"
+# )
+
+# Create the output folder automatically
+OUTPUT_DIR = Path("pokhara_study_area")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+PNG_OUTPUT = OUTPUT_DIR / "Pokhara_study_area_map.png"
+PDF_OUTPUT = OUTPUT_DIR / "Pokhara_study_area_map.pdf"
+SVG_OUTPUT = OUTPUT_DIR / "Pokhara_study_area_map.svg"
+
+
+# ============================================================
+# 2. POKHARA AERONET STATION INFORMATION
+# ============================================================
+
+POKHARA_SITE = {
+    "name": "Pokhara AERONET",
+    "longitude": 83.975180,
+    "latitude": 28.186643,
+    "elevation_m": 800,
+}
+
+
+# ============================================================
+# 3. READ THE UPDATED ADMINISTRATIVE SHAPEFILE
+# ============================================================
+
+if not LOCAL_UNIT_SHP.exists():
+    raise FileNotFoundError(
+        "The shapefile was not found:\n"
+        f"{LOCAL_UNIT_SHP.resolve()}\n\n"
+        "Place local_unit.shp, local_unit.shx, local_unit.dbf, "
+        "and local_unit.prj in the same folder."
+    )
+
+# This allows recovery when the SHX file has a minor issue
+os.environ["SHAPE_RESTORE_SHX"] = "YES"
+
+local_units = gpd.read_file(
+    LOCAL_UNIT_SHP,
+    engine="fiona",
+)
+
+print("Original CRS:")
+print(local_units.crs)
+
+print("\nAvailable columns:")
+print(local_units.columns.tolist())
+
+# Convert the administrative data to WGS84
+if local_units.crs is None:
+    raise ValueError(
+        "The shapefile has no coordinate reference system. "
+        "Make sure local_unit.prj is present."
+    )
+
+local_units = local_units.to_crs("EPSG:4326")
+
+
+# ============================================================
+# 4. STANDARDIZE TEXT COLUMNS
+# ============================================================
+
+required_columns = [
+    "DISTRICT",
+    "GaPa_NaPa",
+]
+
+missing_columns = [
+    column
+    for column in required_columns
+    if column not in local_units.columns
+]
+
+if missing_columns:
+    raise KeyError(
+        "The following required columns were not found:\n"
+        f"{missing_columns}\n\n"
+        f"Available columns are:\n{local_units.columns.tolist()}"
+    )
+
+local_units["DISTRICT"] = (
+    local_units["DISTRICT"]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+)
+
+local_units["GaPa_NaPa"] = (
+    local_units["GaPa_NaPa"]
+    .astype(str)
+    .str.strip()
+)
+
+
+# ============================================================
+# 5. CREATE DISTRICT AND COUNTRY BOUNDARIES
+# ============================================================
+
+# Dissolve local units to obtain district polygons
+districts = local_units.dissolve(
+    by="DISTRICT",
+    as_index=False,
+)
+
+# Dissolve all polygons to obtain Nepal's outer boundary
+nepal_boundary = local_units.dissolve()
+
+
+# ============================================================
+# 6. CREATE THE POKHARA STATION POINT
+# ============================================================
+
+pokhara_station = gpd.GeoDataFrame(
+    {
+        "site": [POKHARA_SITE["name"]],
+        "elevation_m": [POKHARA_SITE["elevation_m"]],
+    },
+    geometry=[
+        Point(
+            POKHARA_SITE["longitude"],
+            POKHARA_SITE["latitude"],
+        )
+    ],
+    crs="EPSG:4326",
+)
+
+
+# ============================================================
+# 7. IDENTIFY THE DISTRICT CONTAINING THE STATION
+# ============================================================
+
+station_district_join = gpd.sjoin(
+    pokhara_station,
+    districts[["DISTRICT", "geometry"]],
+    how="left",
+    predicate="intersects",
+)
+
+if station_district_join["DISTRICT"].isna().all():
+    raise ValueError(
+        "The Pokhara station could not be matched with a district. "
+        "Check the station coordinates and the shapefile CRS."
+    )
+
+pokhara_district_name = (
+    station_district_join["DISTRICT"]
+    .dropna()
+    .iloc[0]
+)
+
+print("\nDistrict containing the Pokhara station:")
+print(pokhara_district_name)
+
+
+# ============================================================
+# 8. IDENTIFY THE LOCAL UNIT CONTAINING THE STATION
+# ============================================================
+
+station_local_join = gpd.sjoin(
+    pokhara_station,
+    local_units[
+        [
+            "DISTRICT",
+            "GaPa_NaPa",
+            "geometry",
+        ]
+    ],
+    how="left",
+    predicate="intersects",
+)
+
+if station_local_join["GaPa_NaPa"].isna().all():
+    pokhara_local_unit_name = None
+    print("\nThe local unit containing the station was not identified.")
+else:
+    pokhara_local_unit_name = (
+        station_local_join["GaPa_NaPa"]
+        .dropna()
+        .iloc[0]
+    )
+
+    print("\nLocal unit containing the Pokhara station:")
+    print(pokhara_local_unit_name)
+
+
+# ============================================================
+# 9. EXTRACT POKHARA/KASKI DISTRICT DATA
+# ============================================================
+
+pokhara_district = districts[
+    districts["DISTRICT"] == pokhara_district_name
+].copy()
+
+pokhara_district_local_units = local_units[
+    local_units["DISTRICT"] == pokhara_district_name
+].copy()
+
+if pokhara_local_unit_name is not None:
+    station_local_unit = local_units[
+        (
+            local_units["DISTRICT"]
+            == pokhara_district_name
+        )
+        &
+        (
+            local_units["GaPa_NaPa"]
+            == pokhara_local_unit_name
+        )
+    ].copy()
+else:
+    station_local_unit = None
+
+
+# ============================================================
+# 10. CALCULATE MAP EXTENTS
+# ============================================================
+
+def calculate_extent(
+    geodataframe,
+    x_padding_fraction=0.08,
+    y_padding_fraction=0.08,
+):
+    """
+    Calculate a padded map extent from a GeoDataFrame.
+    """
+
+    min_x, min_y, max_x, max_y = geodataframe.total_bounds
+
+    width = max_x - min_x
+    height = max_y - min_y
+
+    x_padding = width * x_padding_fraction
+    y_padding = height * y_padding_fraction
+
+    return [
+        min_x - x_padding,
+        max_x + x_padding,
+        min_y - y_padding,
+        max_y + y_padding,
+    ]
+
+
+nepal_extent = calculate_extent(
+    nepal_boundary,
+    x_padding_fraction=0.04,
+    y_padding_fraction=0.07,
+)
+
+pokhara_extent = calculate_extent(
+    pokhara_district,
+    x_padding_fraction=0.12,
+    y_padding_fraction=0.12,
+)
+
+
+# ============================================================
+# 11. FIGURE STYLE
+# ============================================================
+
+plt.rcParams.update(
+    {
+        "font.family": "serif",
+        "font.serif": [
+            "Times New Roman",
+            "DejaVu Serif",
+        ],
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "axes.linewidth": 0.9,
+    }
+)
+
+
+# ============================================================
+# 12. HELPER FUNCTIONS
+# ============================================================
+
+def format_map_axis(
+    axis,
+    extent,
+    title,
+    panel_label,
+):
+    """
+    Format the coordinate grid, labels, title, and panel label.
+    """
+
+    axis.set_xlim(
+        extent[0],
+        extent[1],
+    )
+
+    axis.set_ylim(
+        extent[2],
+        extent[3],
+    )
+
+    axis.set_aspect(
+        "equal",
+        adjustable="box",
+    )
+
+    axis.set_xlabel(
+        "Longitude (°E)"
+    )
+
+    axis.set_ylabel(
+        "Latitude (°N)"
+    )
+
+    axis.set_title(
+        title,
+        fontweight="bold",
+        pad=9,
+    )
+
+    axis.grid(
+        True,
+        linestyle=":",
+        linewidth=0.45,
+        alpha=0.65,
+    )
+
+    for spine in axis.spines.values():
+        spine.set_color("black")
+        spine.set_linewidth(1.0)
+
+    axis.text(
+        0.02,
+        0.97,
+        panel_label,
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        bbox={
+            "facecolor": "white",
+            "edgecolor": "black",
+            "linewidth": 0.7,
+            "boxstyle": "square,pad=0.20",
+        },
+        zorder=20,
+    )
+
+
+def plot_pokhara_station(
+    axis,
+    longitude_offset,
+    latitude_offset,
+):
+    """
+    Plot the Pokhara AERONET station and its label.
+    """
+
+    axis.scatter(
+        POKHARA_SITE["longitude"],
+        POKHARA_SITE["latitude"],
+        marker="*",
+        s=170,
+        facecolor="red",
+        edgecolor="black",
+        linewidth=0.9,
+        zorder=15,
+    )
+
+    axis.annotate(
+        "Pokhara AERONET",
+        xy=(
+            POKHARA_SITE["longitude"],
+            POKHARA_SITE["latitude"],
+        ),
+        xytext=(
+            POKHARA_SITE["longitude"]
+            + longitude_offset,
+            POKHARA_SITE["latitude"]
+            + latitude_offset,
+        ),
+        fontsize=9,
+        fontweight="bold",
+        ha="left",
+        va="bottom",
+        arrowprops={
+            "arrowstyle": "-",
+            "linewidth": 0.8,
+            "color": "black",
+        },
+        bbox={
+            "facecolor": "white",
+            "edgecolor": "none",
+            "alpha": 0.80,
+            "pad": 1.5,
+        },
+        zorder=16,
+    )
+
+
+def add_north_arrow(
+    axis,
+    x=0.91,
+    y=0.88,
+):
+    """
+    Add a simple north arrow.
+    """
+
+    axis.annotate(
+        "N",
+        xy=(x, y),
+        xytext=(x, y - 0.13),
+        xycoords=axis.transAxes,
+        textcoords=axis.transAxes,
+        ha="center",
+        va="center",
+        fontsize=10,
+        fontweight="bold",
+        arrowprops={
+            "arrowstyle": "-|>",
+            "linewidth": 1.1,
+            "color": "black",
+        },
+        zorder=20,
+    )
+
+
+# ============================================================
+# 13. CREATE TWO-PANEL FIGURE
+# ============================================================
+
+fig, axes = plt.subplots(
+    nrows=1,
+    ncols=2,
+    figsize=(12, 6.2),
+    gridspec_kw={
+        "width_ratios": [
+            1.35,
+            1.00,
+        ],
+        "wspace": 0.16,
+    },
+)
+
+ax_nepal = axes[0]
+ax_pokhara = axes[1]
+
+
+# ============================================================
+# 14. PANEL (a): MAP OF NEPAL
+# ============================================================
+
+# Draw local administrative boundaries
+local_units.plot(
+    ax=ax_nepal,
+    facecolor="#f7f7f7",
+    edgecolor="0.65",
+    linewidth=0.20,
+    zorder=1,
+)
+
+# Draw district boundaries
+districts.boundary.plot(
+    ax=ax_nepal,
+    color="0.35",
+    linewidth=0.45,
+    zorder=2,
+)
+
+# Draw outer Nepal border
+nepal_boundary.boundary.plot(
+    ax=ax_nepal,
+    color="black",
+    linewidth=1.1,
+    zorder=3,
+)
+
+# Highlight Kaski District
+pokhara_district.plot(
+    ax=ax_nepal,
+    facecolor="#f2b968",
+    edgecolor="black",
+    linewidth=0.9,
+    zorder=5,
+)
+
+# Plot Pokhara station
+plot_pokhara_station(
+    ax_nepal,
+    longitude_offset=0.15,
+    latitude_offset=0.08,
+)
+
+format_map_axis(
+    ax_nepal,
+    nepal_extent,
+    "Location of the Pokhara AERONET station in Nepal",
+    "(a)",
+)
+
+add_north_arrow(
+    ax_nepal,
+    x=0.92,
+    y=0.88,
+)
+
+
+# ============================================================
+# 15. PANEL (b): POKHARA/KASKI DISTRICT
+# ============================================================
+
+# Plot all local units within the district
+pokhara_district_local_units.plot(
+    ax=ax_pokhara,
+    facecolor="#eef3ef",
+    edgecolor="0.40",
+    linewidth=0.65,
+    zorder=1,
+)
+
+# Highlight the local unit containing the AERONET station
+if (
+    station_local_unit is not None
+    and not station_local_unit.empty
+):
+    station_local_unit.plot(
+        ax=ax_pokhara,
+        facecolor="#f2b968",
+        edgecolor="black",
+        linewidth=0.9,
+        zorder=3,
+    )
+
+# District outer boundary
+pokhara_district.boundary.plot(
+    ax=ax_pokhara,
+    color="black",
+    linewidth=1.2,
+    zorder=4,
+)
+
+# Plot station
+plot_pokhara_station(
+    ax_pokhara,
+    longitude_offset=0.018,
+    latitude_offset=0.012,
+)
+
+format_map_axis(
+    ax_pokhara,
+    pokhara_extent,
+    f"{pokhara_district_name.title()} District and Pokhara AERONET site",
+    "(b)",
+)
+
+add_north_arrow(
+    ax_pokhara,
+    x=0.90,
+    y=0.88,
+)
+
+
+# ============================================================
+# 16. LEGEND
+# ============================================================
+
+legend_elements = [
+    Patch(
+        facecolor="#f2b968",
+        edgecolor="black",
+        label=(
+            pokhara_local_unit_name
+            if pokhara_local_unit_name is not None
+            else "Station local unit"
+        ),
+    ),
+    Patch(
+        facecolor="#eef3ef",
+        edgecolor="0.40",
+        label="Other local units",
+    ),
+    Line2D(
+        [0],
+        [0],
+        marker="*",
+        color="none",
+        markerfacecolor="red",
+        markeredgecolor="black",
+        markersize=12,
+        label="Pokhara AERONET station",
+    ),
+]
+
+ax_pokhara.legend(
+    handles=legend_elements,
+    loc="lower left",
+    fontsize=8,
+    frameon=True,
+    framealpha=0.95,
+    edgecolor="black",
+)
+
+
+# ============================================================
+# 17. SAVE THE FIGURE
+# ============================================================
+
+fig.savefig(
+    PNG_OUTPUT,
+    dpi=600,
+    bbox_inches="tight",
+    facecolor="white",
+)
+
+fig.savefig(
+    PDF_OUTPUT,
+    bbox_inches="tight",
+    facecolor="white",
+)
+
+fig.savefig(
+    SVG_OUTPUT,
+    bbox_inches="tight",
+    facecolor="white",
+)
+
+plt.show()
+
+
+# ============================================================
+# 18. PRINT OUTPUT INFORMATION
+# ============================================================
+
+print("\n" + "=" * 75)
+print("POKHARA STUDY-AREA FIGURE COMPLETED")
+print("=" * 75)
+
+print("\nDetected district:")
+print(pokhara_district_name)
+
+print("\nDetected local administrative unit:")
+print(pokhara_local_unit_name)
+
+print("\nFiles saved inside:")
+print(OUTPUT_DIR.resolve())
+
+print("\nPNG:")
+print(PNG_OUTPUT.resolve())
+
+print("\nPDF:")
+print(PDF_OUTPUT.resolve())
+
+print("\nSVG:")
+print(SVG_OUTPUT.resolve())
