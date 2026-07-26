@@ -1,0 +1,428 @@
+from pathlib import Path
+import os
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from shapely.geometry import Point
+
+# ============================================================
+# 1. FILE PATHS
+# ============================================================
+
+# If you are running inside this workspace, these names are correct.
+# If you are running on your own computer, replace them with your local paths.
+
+#LOCAL_UNIT_SHP = Path("/mnt/data/local_unit.shp")
+LOCAL_UNIT_SHP = Path(r"C:\Users\gpadh\Downloads\local_unit.shp")
+# Output folder
+OUTPUT_DIR = Path("./study_site_figure_output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+PNG_OUT = OUTPUT_DIR / "Figure_1_study_sites_new_admin_map.png"
+PDF_OUT = OUTPUT_DIR / "Figure_1_study_sites_new_admin_map.pdf"
+SVG_OUT = OUTPUT_DIR / "Figure_1_study_sites_new_admin_map.svg"
+
+# ============================================================
+# 2. STATION COORDINATES
+# ============================================================
+
+sites = {
+    "Kathmandu (ICIMOD)": {
+        "lon": 85.323269,
+        "lat": 27.646647,
+        "marker": "o",
+        "short_name": "ICIMOD",
+        "color": "crimson",
+    },
+    "Pokhara": {
+        "lon": 83.975180,
+        "lat": 28.186643,
+        "marker": "^",
+        "short_name": "Pokhara",
+        "color": "crimson",
+    },
+}
+
+# ============================================================
+# 3. READ LOCAL-UNIT SHAPEFILE
+# ============================================================
+
+# Helpful when .shx recovery is needed
+os.environ["SHAPE_RESTORE_SHX"] = "YES"
+
+local_units = gpd.read_file(LOCAL_UNIT_SHP, engine="fiona")
+
+# Ensure CRS is WGS84
+if local_units.crs is None:
+    local_units = local_units.set_crs(epsg=4326)
+else:
+    local_units = local_units.to_crs(epsg=4326)
+
+print("Columns in local-unit shapefile:")
+print(local_units.columns.tolist())
+
+# Expected useful columns:
+# ['STATE_CODE', 'DISTRICT', 'GaPa_NaPa', 'Type_GN', 'Province', 'geometry']
+
+# ============================================================
+# 4. CREATE NEPAL OUTER BOUNDARY AND DISTRICT LAYER
+# ============================================================
+
+# Nepal outer boundary
+nepal_boundary = local_units.dissolve()
+
+# District boundaries from local units
+districts = local_units.dissolve(by="DISTRICT", as_index=False)
+
+# ============================================================
+# 5. CREATE STATION GEODATAFRAME
+# ============================================================
+
+station_rows = []
+for site_name, info in sites.items():
+    station_rows.append(
+        {
+            "site": site_name,
+            "short_name": info["short_name"],
+            "geometry": Point(info["lon"], info["lat"]),
+        }
+    )
+
+stations_gdf = gpd.GeoDataFrame(station_rows, crs="EPSG:4326")
+
+# ============================================================
+# 6. FIND DISTRICT AND LOCAL UNIT FOR EACH STATION
+# ============================================================
+
+# Join stations to districts
+station_district = gpd.sjoin(
+    stations_gdf,
+    districts[["DISTRICT", "geometry"]],
+    how="left",
+    predicate="within",
+)
+
+# Join stations to local units
+station_localunit = gpd.sjoin(
+    stations_gdf,
+    local_units[["DISTRICT", "GaPa_NaPa", "Type_GN", "geometry"]],
+    how="left",
+    predicate="within",
+)
+
+print("\nStation-to-district match:")
+print(station_district[["site", "DISTRICT"]])
+
+print("\nStation-to-local-unit match:")
+print(station_localunit[["site", "DISTRICT", "GaPa_NaPa", "Type_GN"]])
+
+# Extract names for easier use
+ktm_district_name = station_district.loc[
+    station_district["site"] == "Kathmandu (ICIMOD)", "DISTRICT"
+].iloc[0]
+
+pkh_district_name = station_district.loc[
+    station_district["site"] == "Pokhara", "DISTRICT"
+].iloc[0]
+
+ktm_local_name = station_localunit.loc[
+    station_localunit["site"] == "Kathmandu (ICIMOD)", "GaPa_NaPa"
+].iloc[0]
+
+pkh_local_name = station_localunit.loc[
+    station_localunit["site"] == "Pokhara", "GaPa_NaPa"
+].iloc[0]
+
+print("\nKathmandu station district:", ktm_district_name)
+print("Kathmandu station local unit:", ktm_local_name)
+
+print("Pokhara station district:", pkh_district_name)
+print("Pokhara station local unit:", pkh_local_name)
+
+# ============================================================
+# 7. SELECT DISTRICTS AND LOCAL UNITS FOR PANELS b AND c
+# ============================================================
+
+ktm_district = districts[districts["DISTRICT"] == ktm_district_name].copy()
+pkh_district = districts[districts["DISTRICT"] == pkh_district_name].copy()
+
+ktm_local_units = local_units[local_units["DISTRICT"] == ktm_district_name].copy()
+pkh_local_units = local_units[local_units["DISTRICT"] == pkh_district_name].copy()
+
+ktm_station_unit = local_units[
+    (local_units["DISTRICT"] == ktm_district_name)
+    & (local_units["GaPa_NaPa"] == ktm_local_name)
+].copy()
+
+pkh_station_unit = local_units[
+    (local_units["DISTRICT"] == pkh_district_name)
+    & (local_units["GaPa_NaPa"] == pkh_local_name)
+].copy()
+
+# ============================================================
+# 8. MAP EXTENTS
+# ============================================================
+
+# Nepal extent from geometry bounds plus small padding
+xmin, ymin, xmax, ymax = local_units.total_bounds
+nepal_extent = [xmin - 0.6, xmax + 0.4, ymin - 0.3, ymax + 0.3]
+
+def padded_extent(gdf, xpad=0.08, ypad=0.06):
+    minx, miny, maxx, maxy = gdf.total_bounds
+    return [minx - xpad, maxx + xpad, miny - ypad, maxy + ypad]
+
+ktm_extent = padded_extent(ktm_district, xpad=0.08, ypad=0.05)
+pkh_extent = padded_extent(pkh_district, xpad=0.08, ypad=0.05)
+
+# ============================================================
+# 9. FIGURE STYLE
+# ============================================================
+
+plt.rcParams.update(
+    {
+        "font.family": "serif",
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+    }
+)
+
+def format_axes(ax, extent, title, panel_label):
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_title(title, fontweight="bold", pad=8)
+    ax.set_xlabel("Longitude (°E)")
+    ax.set_ylabel("Latitude (°N)")
+    ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.65)
+
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+        spine.set_color("black")
+
+    ax.text(
+        0.02,
+        0.97,
+        panel_label,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        bbox=dict(facecolor="white", edgecolor="black", boxstyle="square,pad=0.20"),
+    )
+
+def plot_station(ax, site_key, dx=0.01, dy=0.01):
+    info = sites[site_key]
+    ax.scatter(
+        info["lon"],
+        info["lat"],
+        s=90,
+        c=info["color"],
+        marker=info["marker"],
+        edgecolors="black",
+        linewidths=0.8,
+        zorder=10,
+    )
+    ax.text(
+        info["lon"] + dx,
+        info["lat"] + dy,
+        info["short_name"],
+        fontsize=9,
+        fontweight="bold",
+        color="black",
+        zorder=11,
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.75, pad=1.0),
+    )
+
+# ============================================================
+# 10. CREATE MULTI-PANEL FIGURE
+# ============================================================
+
+fig = plt.figure(figsize=(11.5, 9.2))
+gs = fig.add_gridspec(
+    2, 2,
+    height_ratios=[1.05, 1.0],
+    hspace=0.23,
+    wspace=0.15
+)
+
+ax1 = fig.add_subplot(gs[0, :])   # Nepal overview
+ax2 = fig.add_subplot(gs[1, 0])   # Kathmandu district
+ax3 = fig.add_subplot(gs[1, 1])   # Pokhara district
+
+# ============================================================
+# 11. PANEL (a): NEPAL OVERVIEW
+# ============================================================
+
+local_units.plot(
+    ax=ax1,
+    facecolor="#f7f7f7",
+    edgecolor="0.55",
+    linewidth=0.25,
+    zorder=1,
+)
+
+districts.boundary.plot(
+    ax=ax1,
+    color="0.35",
+    linewidth=0.55,
+    zorder=2,
+)
+
+nepal_boundary.boundary.plot(
+    ax=ax1,
+    color="black",
+    linewidth=1.1,
+    zorder=3,
+)
+
+# Highlight the two districts
+ktm_district.plot(
+    ax=ax1,
+    facecolor="#efb867",
+    edgecolor="black",
+    linewidth=0.8,
+    zorder=4,
+)
+
+pkh_district.plot(
+    ax=ax1,
+    facecolor="#a8d5ba",
+    edgecolor="black",
+    linewidth=0.8,
+    zorder=4,
+)
+
+# Plot stations
+plot_station(ax1, "Kathmandu (ICIMOD)", dx=0.08, dy=0.05)
+plot_station(ax1, "Pokhara", dx=0.08, dy=0.05)
+
+# Add rectangles showing zoom areas
+ax1.add_patch(
+    Rectangle(
+        (ktm_extent[0], ktm_extent[2]),
+        ktm_extent[1] - ktm_extent[0],
+        ktm_extent[3] - ktm_extent[2],
+        fill=False,
+        edgecolor="black",
+        linewidth=1.0,
+        linestyle="--",
+        zorder=5,
+    )
+)
+
+ax1.add_patch(
+    Rectangle(
+        (pkh_extent[0], pkh_extent[2]),
+        pkh_extent[1] - pkh_extent[0],
+        pkh_extent[3] - pkh_extent[2],
+        fill=False,
+        edgecolor="black",
+        linewidth=1.0,
+        linestyle="--",
+        zorder=5,
+    )
+)
+
+format_axes(
+    ax1,
+    nepal_extent,
+    "Study area and AERONET station locations in Nepal",
+    "(a)"
+)
+
+# ============================================================
+# 12. PANEL (b): KATHMANDU DISTRICT
+# ============================================================
+
+# All local units in Kathmandu district
+ktm_local_units.plot(
+    ax=ax2,
+    facecolor="#f8f1df",
+    edgecolor="0.45",
+    linewidth=0.5,
+    zorder=1,
+)
+
+# Highlight the local unit containing the station
+ktm_station_unit.plot(
+    ax=ax2,
+    facecolor="#efb867",
+    edgecolor="black",
+    linewidth=0.9,
+    zorder=2,
+)
+
+# District outer boundary
+ktm_district.boundary.plot(
+    ax=ax2,
+    color="black",
+    linewidth=1.1,
+    zorder=3,
+)
+
+# Station
+plot_station(ax2, "Kathmandu (ICIMOD)", dx=0.008, dy=0.006)
+
+format_axes(
+    ax2,
+    ktm_extent,
+    f"{ktm_district_name.title()} District",
+    "(b)"
+)
+
+# ============================================================
+# 13. PANEL (c): POKHARA / KASKI DISTRICT
+# ============================================================
+
+pkh_local_units.plot(
+    ax=ax3,
+    facecolor="#edf6f0",
+    edgecolor="0.45",
+    linewidth=0.5,
+    zorder=1,
+)
+
+pkh_station_unit.plot(
+    ax=ax3,
+    facecolor="#a8d5ba",
+    edgecolor="black",
+    linewidth=0.9,
+    zorder=2,
+)
+
+pkh_district.boundary.plot(
+    ax=ax3,
+    color="black",
+    linewidth=1.1,
+    zorder=3,
+)
+
+plot_station(ax3, "Pokhara", dx=0.008, dy=0.006)
+
+format_axes(
+    ax3,
+    pkh_extent,
+    f"{pkh_district_name.title()} District",
+    "(c)"
+)
+
+# ============================================================
+# 14. SAVE FIGURE
+# ============================================================
+
+plt.tight_layout()
+
+fig.savefig(PNG_OUT, dpi=600, bbox_inches="tight", facecolor="white")
+fig.savefig(PDF_OUT, bbox_inches="tight", facecolor="white")
+fig.savefig(SVG_OUT, bbox_inches="tight", facecolor="white")
+
+plt.show()
+
+print("Saved files:")
+print(PNG_OUT)
+print(PDF_OUT)
+print(SVG_OUT)
